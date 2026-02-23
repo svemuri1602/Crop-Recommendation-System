@@ -12,19 +12,9 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
+import joblib
 from io import BytesIO
 from datetime import datetime
-
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, f1_score
-
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.svm import SVC
-from sklearn.linear_model import LogisticRegression
-from sklearn.naive_bayes import GaussianNB
 
 # PDF (ReportLab)
 from reportlab.lib.pagesizes import letter
@@ -33,121 +23,28 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from reportlab.lib.styles import getSampleStyleSheet
 
 
-# ------------------ Streamlit Config ------------------
 st.set_page_config(page_title="🌾 Crop Recommendation", page_icon="🌾", layout="centered")
+st.title("🌾 Crop Recommendation")
+st.caption("Enter soil + weather values → get the best crop recommendation instantly.")
 
-st.title("🌾 Crop Recommendation using ML")
-st.caption("Enter soil + weather values → ML predicts the most suitable crop (auto-picks best model).")
-
-DATA_PATH = "Crop_recommendation.csv"  # keep this CSV in same folder as app.py in GitHub repo
-
-
-# ------------------ Helpers ------------------
-@st.cache_data
-def load_data(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    # Basic validation
-    expected = {"N", "P", "K", "temperature", "humidity", "ph", "rainfall", "label"}
-    missing = expected - set(df.columns)
-    if missing:
-        raise ValueError(f"Dataset is missing columns: {missing}")
-    return df
-
-
-def build_models(seed: int):
-    """
-    dict[name] = sklearn Pipeline/Estimator
-    Use scaling for distance-based / linear / SVM models.
-    """
-    return {
-        "Random Forest": Pipeline([
-            ("model", RandomForestClassifier(n_estimators=500, random_state=seed, n_jobs=-1))
-        ]),
-        "Gradient Boosting": Pipeline([
-            ("model", GradientBoostingClassifier(random_state=seed))
-        ]),
-        "KNN (Scaled)": Pipeline([
-            ("scaler", StandardScaler()),
-            ("model", KNeighborsClassifier(n_neighbors=7))
-        ]),
-        "SVM RBF (Scaled, Prob)": Pipeline([
-            ("scaler", StandardScaler()),
-            ("model", SVC(kernel="rbf", probability=True, random_state=seed))
-        ]),
-        "Logistic Regression (Scaled)": Pipeline([
-            ("scaler", StandardScaler()),
-            ("model", LogisticRegression(max_iter=3000, n_jobs=-1))
-        ]),
-        "Naive Bayes": Pipeline([
-            ("model", GaussianNB())
-        ]),
-    }
+MODEL_PATH = "model.pkl"  # must be in the GitHub repo
 
 
 @st.cache_resource
-def train_and_compare(df: pd.DataFrame, test_size: float, seed: int):
-    X = df.drop(columns=["label"])
-    y = df["label"]
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y,
-        test_size=test_size,
-        random_state=seed,
-        stratify=y
-    )
-
-    models = build_models(seed)
-
-    rows = []
-    fitted = {}
-
-    for name, pipe in models.items():
-        pipe.fit(X_train, y_train)
-        preds = pipe.predict(X_test)
-
-        acc = accuracy_score(y_test, preds)
-        f1m = f1_score(y_test, preds, average="macro")
-
-        rows.append({"Model": name, "Accuracy": acc, "Macro F1": f1m})
-        fitted[name] = pipe
-
-    results_df = (
-        pd.DataFrame(rows)
-        .sort_values(by=["Macro F1", "Accuracy"], ascending=False)
-        .reset_index(drop=True)
-    )
-
-    best_name = results_df.loc[0, "Model"]
-    best_model = fitted[best_name]
-    feature_cols = list(X.columns)
-
-    return best_model, best_name, results_df, feature_cols
+def load_model():
+    return joblib.load(MODEL_PATH)
 
 
-def generate_pdf_report(
-    inputs_dict: dict,
-    best_model_name: str,
-    model_results_df: pd.DataFrame,
-    prediction_df: pd.DataFrame,
-) -> bytes:
-    """
-    Returns PDF bytes.
-    """
+def generate_pdf_report(inputs_dict: dict, prediction_df: pd.DataFrame) -> bytes:
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter, title="Crop Recommendation Report")
     styles = getSampleStyleSheet()
     story = []
 
-    # Title
     story.append(Paragraph("Crop Recommendation Report", styles["Title"]))
     story.append(Paragraph(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles["Normal"]))
     story.append(Spacer(1, 12))
 
-    # Best model
-    story.append(Paragraph(f"<b>Best Model Used:</b> {best_model_name}", styles["Normal"]))
-    story.append(Spacer(1, 12))
-
-    # Inputs table
     story.append(Paragraph("<b>User Inputs</b>", styles["Heading2"]))
     inputs_table_data = [["Feature", "Value"]] + [[k, str(v)] for k, v in inputs_dict.items()]
     t_inputs = Table(inputs_table_data, hAlign="LEFT")
@@ -160,7 +57,6 @@ def generate_pdf_report(
     story.append(t_inputs)
     story.append(Spacer(1, 14))
 
-    # Prediction table
     story.append(Paragraph("<b>Prediction</b>", styles["Heading2"]))
     pred_data = [prediction_df.columns.tolist()] + prediction_df.astype(str).values.tolist()
     t_pred = Table(pred_data, hAlign="LEFT")
@@ -171,25 +67,6 @@ def generate_pdf_report(
         ("PADDING", (0, 0), (-1, -1), 6),
     ]))
     story.append(t_pred)
-    story.append(Spacer(1, 14))
-
-    # Model comparison table (top 5)
-    story.append(Paragraph("<b>Model Comparison (Top 5)</b>", styles["Heading2"]))
-    top5 = model_results_df.head(5).copy()
-    if "Accuracy" in top5.columns:
-        top5["Accuracy"] = top5["Accuracy"].map(lambda x: f"{x:.4f}")
-    if "Macro F1" in top5.columns:
-        top5["Macro F1"] = top5["Macro F1"].map(lambda x: f"{x:.4f}")
-
-    comp_data = [top5.columns.tolist()] + top5.values.tolist()
-    t_comp = Table(comp_data, hAlign="LEFT")
-    t_comp.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("PADDING", (0, 0), (-1, -1), 6),
-    ]))
-    story.append(t_comp)
 
     doc.build(story)
     pdf_bytes = buffer.getvalue()
@@ -197,52 +74,30 @@ def generate_pdf_report(
     return pdf_bytes
 
 
-# ------------------ Sidebar ------------------
-with st.sidebar:
-    st.header("⚙️ Training Settings")
-    test_size = st.slider("Test split", 0.1, 0.4, 0.2, 0.05)
-    seed = st.number_input("Random seed", min_value=1, max_value=9999, value=42, step=1)
+# Load model once (cached)
+model = load_model()
 
-    st.markdown("---")
-    st.header("🧪 Quick Demo")
-    fill_sample = st.button("Fill sample inputs")
-
-
-# ------------------ Load + Train ------------------
-df = load_data(DATA_PATH)
-best_model, best_name, results_df, feature_cols = train_and_compare(df, test_size, seed)
-
-st.subheader("🏁 Model Comparison (auto-trained)")
-st.write("Sorted by **Macro F1** (better multi-class balance), then Accuracy.")
-st.dataframe(
-    results_df.style.format({"Accuracy": "{:.4f}", "Macro F1": "{:.4f}"}),
-    use_container_width=True
-)
-st.success(f"✅ Auto-selected best model: **{best_name}**")
-
-st.markdown("---")
+# -------- UI Inputs only --------
 st.subheader("🧾 Enter Inputs")
-
-# Sample defaults
-default = dict(N=90, P=42, K=43, temperature=20.88, humidity=82.00, ph=6.50, rainfall=202.94)
-if fill_sample:
-    st.info("Sample values filled ✅")
 
 col1, col2 = st.columns(2)
 with col1:
-    N = st.number_input("Nitrogen (N)", 0.0, 200.0, float(default["N"]), 1.0)
-    P = st.number_input("Phosphorus (P)", 0.0, 200.0, float(default["P"]), 1.0)
-    K = st.number_input("Potassium (K)", 0.0, 200.0, float(default["K"]), 1.0)
-    temperature = st.number_input("Temperature (°C)", -5.0, 60.0, float(default["temperature"]), 0.1)
+    N = st.number_input("Nitrogen (N)", 0.0, 200.0, 50.0, 1.0)
+    P = st.number_input("Phosphorus (P)", 0.0, 200.0, 50.0, 1.0)
+    K = st.number_input("Potassium (K)", 0.0, 200.0, 50.0, 1.0)
+    temperature = st.number_input("Temperature (°C)", -5.0, 60.0, 25.0, 0.1)
 
 with col2:
-    humidity = st.number_input("Humidity (%)", 0.0, 100.0, float(default["humidity"]), 0.1)
-    ph = st.number_input("pH", 0.0, 14.0, float(default["ph"]), 0.1)
-    rainfall = st.number_input("Rainfall (mm)", 0.0, 500.0, float(default["rainfall"]), 0.1)
+    humidity = st.number_input("Humidity (%)", 0.0, 100.0, 60.0, 0.1)
+    ph = st.number_input("pH", 0.0, 14.0, 6.5, 0.1)
+    rainfall = st.number_input("Rainfall (mm)", 0.0, 500.0, 100.0, 0.1)
 
-X_user = pd.DataFrame([[N, P, K, temperature, humidity, ph, rainfall]], columns=feature_cols)
+X_user = pd.DataFrame([[N, P, K, temperature, humidity, ph, rainfall]],
+                      columns=["N", "P", "K", "temperature", "humidity", "ph", "rainfall"])
 
-if st.button("🌱 Recommend Crop"):
+st.markdown("---")
+if st.button("🌱 Predict Crop"):
+    # Prediction (Top-3 if model supports probabilities)
     inputs_dict = {
         "Nitrogen (N)": N,
         "Phosphorus (P)": P,
@@ -253,64 +108,42 @@ if st.button("🌱 Recommend Crop"):
         "Rainfall (mm)": rainfall,
     }
 
-    # Top-3 if probabilities exist
-    if hasattr(best_model, "predict_proba"):
-        proba = best_model.predict_proba(X_user)[0]
-        classes = best_model.classes_
+    if hasattr(model, "predict_proba"):
+        proba = model.predict_proba(X_user)[0]
+        classes = model.classes_
         top_idx = np.argsort(proba)[::-1][:3]
 
         best_crop = classes[top_idx[0]]
-        st.success(f"✅ Best crop: **{best_crop}**")
+        st.success(f"✅ Recommended crop: **{best_crop}**")
 
-        out = pd.DataFrame({
+        result_df = pd.DataFrame({
             "Rank": [1, 2, 3],
             "Crop": [classes[top_idx[0]], classes[top_idx[1]], classes[top_idx[2]]],
-            "Confidence (%)": [
-                round(proba[top_idx[0]] * 100, 2),
-                round(proba[top_idx[1]] * 100, 2),
-                round(proba[top_idx[2]] * 100, 2),
-            ]
+            "Confidence (%)": [round(proba[top_idx[0]] * 100, 2),
+                               round(proba[top_idx[1]] * 100, 2),
+                               round(proba[top_idx[2]] * 100, 2)]
         })
 
-        st.dataframe(out[["Crop", "Confidence (%)"]], use_container_width=True)
-        st.bar_chart(out.set_index("Crop")[["Confidence (%)"]])
+        st.subheader("Results")
+        st.dataframe(result_df, use_container_width=True)
+        st.bar_chart(result_df.set_index("Crop")[["Confidence (%)"]])
 
-        # PDF
-        pdf_bytes = generate_pdf_report(
-            inputs_dict=inputs_dict,
-            best_model_name=best_name,
-            model_results_df=results_df,
-            prediction_df=out
-        )
-
-        st.download_button(
-            label="📄 Download PDF Report",
-            data=pdf_bytes,
-            file_name="crop_recommendation_report.pdf",
-            mime="application/pdf"
-        )
+        pdf_bytes = generate_pdf_report(inputs_dict, result_df)
 
     else:
-        pred = best_model.predict(X_user)[0]
+        pred = model.predict(X_user)[0]
         st.success(f"✅ Recommended crop: **{pred}**")
-        st.caption("Note: This model doesn’t provide probabilities, so Top-3 is not available.")
 
-        out = pd.DataFrame({"Result": ["Recommended Crop"], "Value": [str(pred)]})
+        result_df = pd.DataFrame({"Result": ["Recommended Crop"], "Value": [str(pred)]})
 
-        # PDF
-        pdf_bytes = generate_pdf_report(
-            inputs_dict=inputs_dict,
-            best_model_name=best_name,
-            model_results_df=results_df,
-            prediction_df=out
-        )
+        st.subheader("Results")
+        st.dataframe(result_df, use_container_width=True)
 
-        st.download_button(
-            label="📄 Download PDF Report",
-            data=pdf_bytes,
-            file_name="crop_recommendation_report.pdf",
-            mime="application/pdf"
-        )
+        pdf_bytes = generate_pdf_report(inputs_dict, result_df)
 
-st.markdown("---")
-st.caption("Dataset: Crop_recommendation.csv (N, P, K, temperature, humidity, ph, rainfall → label)")
+    st.download_button(
+        label="📄 Download PDF Report",
+        data=pdf_bytes,
+        file_name="crop_recommendation_report.pdf",
+        mime="application/pdf"
+    )
